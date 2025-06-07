@@ -1,88 +1,101 @@
+
 import json
-import os
+import re
 from pathlib import Path
 
-RAW_PATH  = Path("F:\AmazonHack\Data_Scraping\Sports.json")
-CLEANED_PATH = Path("F:\AmazonHack\Data_Scraping\cleaned.json")
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Filenames (modify if needed)
+# ─────────────────────────────────────────────────────────────────────────────
+RAW_JSON_FILENAME     = "Electronics.json"    # <-- Your raw scraped JSON
+CLEANED_JSON_FILENAME = "cleaned.json"
 
-def write_clean_entry(clean_obj, out_path: Path):
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) Preprocessing function
+# ─────────────────────────────────────────────────────────────────────────────
+def preprocess_text(text: str) -> str:
     """
-    Appends a single JSON object to out_path, maintaining valid JSON array format.
-    - If out_path does not exist, create it as “[ {...} ]”.
-    - If out_path already exists, insert “,\n <new_obj> \n]” right before the existing closing bracket.
+    - Lowercase
+    - Replace any non-alphanumeric (except whitespace) with a space
+    - Collapse multiple spaces
     """
-    entry_str = json.dumps(clean_obj, ensure_ascii=False)
-    if not out_path.exists():
-        # First time: create new file, write “[ \n <entry> \n ]”
-        with open(out_path, "w", encoding="utf-8") as f_out:
-            f_out.write("[\n")
-            f_out.write(entry_str)
-            f_out.write("\n]")
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', " ", text)
+    text = re.sub(r'\s+', " ", text).strip()
+    return text
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Clean & Append Logic
+# ─────────────────────────────────────────────────────────────────────────────
+def clean_and_append(raw_path: Path, cleaned_path: Path):
+  
+    # 3A) Load or initialize existing list
+    if cleaned_path.exists():
+        print(f"Appending to existing {cleaned_path}")
+        with open(cleaned_path, "r", encoding="utf-8") as f_in:
+            existing = json.load(f_in)
     else:
-        # Append: open in r+ mode, seek back to find the final ‘]’, then insert “, <entry> ]”
-        with open(out_path, "r+", encoding="utf-8") as f_out:
-            # Move pointer to the very end
-            f_out.seek(0, os.SEEK_END)
-            pos = f_out.tell()
+        print(f"No existing {cleaned_path}, creating new.")
+        existing = []
 
-            # Step backwards until we find the first ‘]’ character (ignoring whitespace).
-            # Once found, we’ll overwrite starting at that position.
-            while pos > 0:
-                pos -= 1
-                f_out.seek(pos)
-                if f_out.read(1) == "]":
-                    break
+    # 3B) Load raw entries
+    print(f"Loading raw data from {raw_path}")
+    with open(raw_path, "r", encoding="utf-8") as f_in:
+        raw_entries = json.load(f_in)
 
-            # Now pos is the index of the final ‘]’.
-            f_out.seek(pos)
-            f_out.truncate()                # erase from pos onward
-            f_out.write(",\n")              # comma + newline to separate array items
-            f_out.write(entry_str)          # the new object
-            f_out.write("\n]")              # close the JSON array
-
-def clean_and_append_all():
-    # Open the raw file once, load it as a Python list. (If it's truly enormous,
-    # you could replace this with a streaming parser, but in most cases this
-    # is acceptable. The “on‐the‐go” part is in how we write.)
-    with open(RAW_PATH, "r", encoding="utf-8") as f_raw:
-        raw_entries = json.load(f_raw)
-
+    new_list = []
     for entry in raw_entries:
-        # 1) Extract the ASIN
         asin = entry.get("asin", "").strip()
-
-        # 2) Fields to keep for “clean_text”
-        title       = (entry.get("title")       or "").strip()
-        brand       = (entry.get("brand")       or "").strip()
-        breadcrumbs = (entry.get("breadCrumbs") or "").strip()
+        title = (entry.get("title") or "").strip()            # keep raw title
+        brand = (entry.get("brand") or "").strip()
+        breadcrumbs_raw = (entry.get("breadCrumbs") or "").strip()
         description = (entry.get("description") or "").strip()
 
-        # 3) Pull out every non‐empty “attributes” value
+        # Parse breadcrumbs into a list
+        if breadcrumbs_raw:
+            breadcrumbs_list = [seg.strip() for seg in re.split(r"[>/]", breadcrumbs_raw) if seg.strip()]
+        else:
+            breadcrumbs_list = []
+
+        # Combine attributes "key value"
         attr_texts = []
         for attr in entry.get("attributes", []):
-            key   = attr.get("key", "").strip()
-            value = attr.get("value", "").strip()
-            if value:
-                # e.g. "Product Dimensions: 30 x 25 x 2 cm; 300 g"
-                attr_texts.append(f"{key}: {value}")
+            key = (attr.get("key") or "").strip()
+            val = (attr.get("value") or "").strip()
+            if val:
+                attr_texts.append(f"{key} {val}")
 
-        # 4) Build one large string
-        combined_text = " ".join([
+        # Combine ALL pieces into one string for cleaning
+        combined = " ".join([
             title,
             brand,
-            breadcrumbs,
+            " ".join(breadcrumbs_list),
             description,
             " ".join(attr_texts)
         ]).strip()
 
-        # 5) Create the “clean object”
-        clean_obj = {
+        clean_text = preprocess_text(combined)
+
+        cleaned_obj = {
             "asin": asin,
-            "clean_text": combined_text
+            "title": title,
+            "clean_text": clean_text,
+            "breadcrumbs": breadcrumbs_list
         }
+        new_list.append(cleaned_obj)
 
-        # 6) Append it to cleaned.json (creating the file first if needed)
-        write_clean_entry(clean_obj, CLEANED_PATH)
+    existing.extend(new_list)
+    print(f"Appending {len(new_list)} items to cleaned.json (now {len(existing)} total).")
 
+    with open(cleaned_path, "w", encoding="utf-8") as f_out:
+        json.dump(existing, f_out, ensure_ascii=False, indent=2)
+    print(f"Written updated cleaned data to {cleaned_path}")
+
+    return existing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) Run if script
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    clean_and_append_all()
+    raw_path = Path(RAW_JSON_FILENAME)
+    cleaned_path = Path(CLEANED_JSON_FILENAME)
+    clean_and_append(raw_path, cleaned_path)
