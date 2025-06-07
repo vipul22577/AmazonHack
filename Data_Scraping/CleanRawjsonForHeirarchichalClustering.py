@@ -2,8 +2,8 @@ import json
 import os
 from pathlib import Path
 
-RAW_PATH  = Path("dataset_Amazon-crawler_2025-06-06_13-24-03-537.json")
-CLEANED_PATH = Path("cleaned.json")
+RAW_PATH  = Path("F:\AmazonHack\Data_Scraping\Fashion.json")
+CLEANED_PATH = Path("cleaned_fashion.json")
 
 def write_clean_entry(clean_obj, out_path: Path):
     """
