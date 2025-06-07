@@ -1,3 +1,4 @@
+# Cell 2: build_multi_child_tree_hierarchical_with_retrain_check.py
 
 import json
 import numpy as np
@@ -10,7 +11,7 @@ from gensim.models.doc2vec import Doc2Vec, TaggedDocument
 from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Filenames (current working directory)
+# 1) Filenames (in the current working directory)
 # ─────────────────────────────────────────────────────────────────────────────
 CLEANED_JSON_FILENAME  = "cleaned.json"
 DOC2VEC_MODEL_FILENAME = "doc2vec.model"
@@ -22,25 +23,22 @@ DENDROGRAM_PNG         = "dendrogram.png"
 # ─────────────────────────────────────────────────────────────────────────────
 def load_cleaned_data(path: Path):
     """
-    Each item in cleaned.json has keys:
+    Each item has:
       - "asin"
       - "title"
       - "clean_text"
-      - "breadcrumbs" (list of category segments, e.g. ["Electronics","Cell Phones & Accessories","Cell Phones & Smartphones"])
+      - "breadcrumbs" (list of category segments)
     """
     print(f"Loading cleaned data from: {path}")
     with open(path, "r", encoding="utf-8") as f_in:
         return json.load(f_in)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) Fit TF–IDF on entire clean_text corpus
+# 3) Fit TF–IDF on clean_text corpus
 # ─────────────────────────────────────────────────────────────────────────────
 def fit_tfidf(cleaned_data, max_features=1000):
     """
-    Returns:
-      - tfidf_matrix (N × V)
-      - terms (length V)
-      - vectorizer (the fitted TF–IDF object)
+    Returns (tfidf_matrix [N×V], terms [length V], vectorizer).
     """
     corpus = [item["clean_text"] for item in cleaned_data]
     vectorizer = TfidfVectorizer(max_features=max_features, stop_words="english")
@@ -51,19 +49,19 @@ def fit_tfidf(cleaned_data, max_features=1000):
     return tfidf_mat, terms, vectorizer
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Train or load Doc2Vec
+# 4) Train (or retrain) Doc2Vec if needed
 # ─────────────────────────────────────────────────────────────────────────────
 def train_doc2vec(cleaned_data, vector_size=100, window=5, min_count=2, epochs=40):
     """
-    Train a Doc2Vec (PV-DM) on each product’s 'clean_text', tagging by str(i).
-    Save to DOC2VEC_MODEL_FILENAME.
+    Always trains a fresh Doc2Vec model on the full cleaned_data, tagging by str(i).
+    Saves to DOC2VEC_MODEL_FILENAME.
     """
+    print("Training a new Doc2Vec model on all cleaned entries...")
     tagged_docs = []
     for idx, item in enumerate(cleaned_data):
         tokens = item["clean_text"].split()
         tagged_docs.append(TaggedDocument(tokens, [str(idx)]))
 
-    print("Building Doc2Vec vocabulary...")
     model = Doc2Vec(
         vector_size=vector_size,
         window=window,
@@ -73,52 +71,65 @@ def train_doc2vec(cleaned_data, vector_size=100, window=5, min_count=2, epochs=4
         dm=1
     )
     model.build_vocab(tagged_docs)
-    print(f"Training Doc2Vec for {epochs} epochs...")
     model.train(tagged_docs, total_examples=model.corpus_count, epochs=model.epochs)
     model.save(DOC2VEC_MODEL_FILENAME)
-    print(f"Saved Doc2Vec model to: {DOC2VEC_MODEL_FILENAME}")
+    print(f"Doc2Vec model saved to: {DOC2VEC_MODEL_FILENAME} (trained on N={len(cleaned_data)})")
     return model
 
-def load_or_train_doc2vec(cleaned_data):
-    path = Path(DOC2VEC_MODEL_FILENAME)
-    if path.exists():
-        print(f"Loading existing Doc2Vec from: {path}")
-        return Doc2Vec.load(DOC2VEC_MODEL_FILENAME)
-    else:
+def load_or_retrain_doc2vec(cleaned_data):
+    """
+    - If DOC2VEC_MODEL_FILENAME does not exist, train a new model.
+    - If it does exist, load and check if model.dv.count == len(cleaned_data).
+      • If equal, return the loaded model.
+      • If not, retrain on the full cleaned_data and overwrite.
+    """
+    model_path = Path(DOC2VEC_MODEL_FILENAME)
+    N = len(cleaned_data)
+    if not model_path.exists():
         return train_doc2vec(cleaned_data)
 
+    print(f"Loading existing Doc2Vec model from: {model_path}")
+    model = Doc2Vec.load(DOC2VEC_MODEL_FILENAME)
+    if len(model.dv) != N:
+        print(f"Doc2Vec model has {len(model.dv)} docs, but cleaned.json has {N}. Retraining.")
+        return train_doc2vec(cleaned_data)
+    else:
+        print("Doc2Vec model matches cleaned data length. No retraining needed.")
+        return model
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) Extract each product’s Doc2Vec vector (N×D)
+# 5) Extract Doc2Vec embeddings (N × vector_size)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_doc_vectors(model, num_docs):
+    """
+    Returns array of shape (num_docs, vector_size).
+    Throws KeyError if the model does not have tag str(i) for some i.
+    """
     vectors = []
     for i in range(num_docs):
         vectors.append(model.dv[str(i)])
     return np.vstack(vectors)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) Build Ward linkage tree & plot truncated dendrogram with auto‐cut
+# 6) Build Ward linkage & plot truncated dendrogram with auto‐cut
 # ─────────────────────────────────────────────────────────────────────────────
 def build_and_plot_hierarchy(doc_vectors, cleaned_data, save_path: Path, truncate_level=5):
     """
     1) Compute Z = linkage(doc_vectors, method="ward").
-    2) Plot a truncated dendrogram (showing top 'truncate_level' merges),
-       using the first 20 chars of each product’s title as leaf labels.
-    3) Determine a “cut threshold” by finding the largest gap in Z[:,2].
-    4) Draw a red dashed line at that threshold.
+    2) Plot a truncated dendrogram (top 'truncate_level' merges),
+       labeling leaves by the first 20 characters of each product title.
+    3) Determine auto‐cut threshold by largest gap in Z[:,2].
+    4) Draw a horizontal line at threshold in red dashed.
     5) Return (Z, threshold).
     """
     print("Computing Ward linkage on document vectors...")
     Z = linkage(doc_vectors, method="ward")
 
-    # 2A) Prepare leaf labels (first 20 chars of title)
+    # 2A) Create leaf labels: first 20 chars of title + "…" if longer
     labels = []
     for item in cleaned_data:
         t = item["title"]
-        if len(t) > 20:
-            labels.append(t[:20] + "…")
-        else:
-            labels.append(t)
+        labels.append((t[:20] + "…") if len(t) > 20 else t)
 
     print(f"Plotting truncated dendrogram (top {truncate_level} merges)...")
     plt.figure(figsize=(14, 6))
@@ -135,14 +146,14 @@ def build_and_plot_hierarchy(doc_vectors, cleaned_data, save_path: Path, truncat
     plt.xlabel("Product Title (first 20 chars)")
     plt.ylabel("Ward Distance")
 
-    # 2B) Automatically choose threshold based on largest gap
-    distances = Z[:, 2]            # the distance values at each merge
-    diffs = np.diff(distances)     # gaps between consecutive distances
-    idx_max = np.argmax(diffs)     # index at which gap is largest
+    # 2B) Automatically pick threshold at largest gap
+    distances = Z[:, 2]            # distances for each merge
+    diffs = np.diff(distances)     # gaps between successive distances
+    idx_max = np.argmax(diffs)
     threshold = (distances[idx_max] + distances[idx_max + 1]) / 2.0
-    print(f"Automatically chosen threshold = {threshold:.4f} (gap index = {idx_max})")
+    print(f"Auto‐chosen threshold = {threshold:.4f} (largest gap at index {idx_max})")
 
-    # 2C) Draw a horizontal line at threshold
+    # 2C) Draw horizontal line
     plt.axhline(y=threshold, color="red", linestyle="--", label=f"cut @ {threshold:.2f}")
     plt.legend()
     plt.tight_layout()
@@ -153,30 +164,34 @@ def build_and_plot_hierarchy(doc_vectors, cleaned_data, save_path: Path, truncat
     return Z, threshold
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7) Derive a “category‐based” label from breadcrumbs for each cluster
+# 7) Label clusters by most‐specific breadcrumb (last element)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_cluster_category_label(idxs, cleaned_data):
     """
-    1) For each index in idxs, extract cleaned_data[i]["breadcrumbs"].
-    2) If a product has breadcrumbs = ["Electronics","Cell Phones & Accessories","Cell Phones & Smartphones"],
-       we pick the LAST element: "Cell Phones & Smartphones".
-    3) Count frequencies of these LAST elements across all idxs.  
-    4) If at least one appears, pick the most common; otherwise return None.
+    - idxs: list of product indices belonging to a cluster.
+    - For each i in idxs, fetch cleaned_data[i]["breadcrumbs"].
+    - last_breadcrumb = b[-1] if b is nonempty.
+    - Count frequencies of those last_breadcrumbs; return the most common.
+    - If no breadcrumbs or all empty, return None.
     """
-    last_categories = []
+    last_cats = []
     for i in idxs:
         b = cleaned_data[i]["breadcrumbs"]
         if b:
-            last_categories.append(b[-1])
-    if not last_categories:
+            last_cats.append(b[-1])
+    if not last_cats:
         return None
-    most_common = Counter(last_categories).most_common(1)[0][0]
-    return most_common
+    return Counter(last_cats).most_common(1)[0][0]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8) Derive a TF–IDF fallback label if breadcrumbs fail
+# 8) Fallback: label by top TF–IDF term if breadcrumbs are missing
 # ─────────────────────────────────────────────────────────────────────────────
 def get_cluster_tfidf_label(idxs, tfidf_matrix, terms, top_k=1):
+    """
+    - Sum TF–IDF rows for idxs: sums length‐V vector.
+    - Pick top_k terms from sums. Return "term1 term2" if top_k=2.
+    - If no positive sums, return "misc".
+    """
     submat = tfidf_matrix[idxs, :]
     sums = submat.sum(axis=0)
     top_indices = np.argsort(sums)[-top_k:][::-1]
@@ -186,47 +201,41 @@ def get_cluster_tfidf_label(idxs, tfidf_matrix, terms, top_k=1):
     return " ".join(top_terms)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9) Build the multi‐child JSON by cutting at threshold
+# 9) Build multi‐child tree by cutting dendrogram at threshold
 # ─────────────────────────────────────────────────────────────────────────────
 def build_multi_child_hierarchy(cleaned_data, doc_vectors, tfidf_matrix, terms, Z, threshold):
     """
-    1) Form clusters with fcluster(Z, t=threshold, criterion="distance").  
-    2) For each resulting cluster ID (cid):
-         - idxs = list of product‐indices in that cluster
-         - Try to label = get_cluster_category_label(idxs, cleaned_data)
-         - If None, fallback to get_cluster_tfidf_label(idxs, tfidf_matrix, terms)
-         - Compute centroid = mean(doc_vectors[idxs, :])
+    1) cluster_labels = fcluster(Z, t=threshold, criterion="distance")
+    2) unique_cids = unique(cluster_labels)
+    3) For each cid:
+         - idxs = [i for i in range(N) if cluster_labels[i] == cid]
+         - Try label = get_cluster_category_label(idxs, cleaned_data)
+         - If None, label = get_cluster_tfidf_label(idxs, tfidf_matrix, terms)
+         - centroid = mean(doc_vectors[idxs, :]) as list
          - members = [cleaned_data[i]["asin"] for i in idxs]
-       Construct:
-         {
-           "cluster_id": <cid>,
-           "name": <label>,
-           "centroid": [...100 floats...],
-           "members": [<ASIN1>, <ASIN2>, …]
-         }
-    3) Return { "root": { "children": [cluster_obj, …] } }.
+       Create cluster_obj with keys:
+         { "cluster_id": cid, "name": label, "centroid": centroid, "members": members }
+    4) Return { "root": { "children": [ cluster_obj, ... ] } }.
     """
-    num_docs = len(cleaned_data)
+    N = len(cleaned_data)
+    print("Forming clusters by fcluster at threshold:", threshold)
     cluster_labels = fcluster(Z, t=threshold, criterion="distance")
     unique_cids = np.unique(cluster_labels)
-    print(f"Number of top‐level clusters formed: {len(unique_cids)}")
+    print(f"Number of top‐level clusters: {len(unique_cids)}")
 
-    dv = np.asarray(doc_vectors)
+    dv = np.array(doc_vectors)
     clusters = []
     for cid in unique_cids:
         idxs = np.where(cluster_labels == cid)[0].tolist()
-
-        # 9A) Try category‐based label from breadcrumbs
+        # 9A) Category label by breadcrumbs
         label = get_cluster_category_label(idxs, cleaned_data)
         if label is None:
-            # 9B) Fallback to TF–IDF‐based term
+            # 9B) TF–IDF fallback
             label = get_cluster_tfidf_label(idxs, tfidf_matrix, terms, top_k=1)
-
-        # 9C) Centroid = average of doc_vectors[idxs]
+        # 9C) Compute centroid
         centroid = dv[idxs, :].mean(axis=0).tolist()
         # 9D) Member ASINs
         members = [cleaned_data[i]["asin"] for i in idxs]
-
         clusters.append({
             "cluster_id": int(cid),
             "name": label,
@@ -246,17 +255,17 @@ if __name__ == "__main__":
     N = len(cleaned_data)
     print(f"Total products: {N}")
 
-    # 10B) Fit TF–IDF on 'clean_text'
+    # 10B) Fit TF–IDF
     tfidf_matrix, terms, vectorizer = fit_tfidf(cleaned_data, max_features=1000)
 
-    # 10C) Train or load Doc2Vec
-    model = load_or_train_doc2vec(cleaned_data)
+    # 10C) Load or retrain Doc2Vec
+    model = load_or_retrain_doc2vec(cleaned_data)
 
-    # 10D) Extract Doc2Vec embeddings (N×D)
+    # 10D) Extract Doc2Vec embeddings
     print("Extracting Doc2Vec vectors...")
     doc_vectors = get_doc_vectors(model, N)
 
-    # 10E) Build Ward linkage tree & plot dendrogram + auto cut‐threshold
+    # 10E) Build Ward tree & plot dendrogram with auto cut
     Z, threshold = build_and_plot_hierarchy(
         doc_vectors,
         cleaned_data,
